@@ -167,8 +167,11 @@ typedef enum _GST_PYLONSRC_PROP
   PROP_TRANSFORMATION20,
   PROP_TRANSFORMATION21,
   PROP_TRANSFORMATION22,
-  PROP_CONFIGFILE,
+
+  PROP_CONFIGFILE,              // These properties do not correspond to camera features
   PROP_IGNOREDEFAULTS,
+  PROP_FAILRATE,
+  PROP_GRABTIMEOUT,
 
   PROP_NUM_PROPERTIES           // Yes, there is PROP_0 that represent nothing, so actually there are (PROP_NUMPROPS - 1) properties.
       // But this way you can intuitively access propFlags[] by index
@@ -288,6 +291,8 @@ ascii_strdown (gchar * *str, gssize len)
 }
 
 #define DEFAULT_PROP_PIXEL_FORMAT "auto"
+#define DEFAULT_PROP_FAILRATE                         10
+#define DEFAULT_PROP_GRABTIMEOUT                      1000
 
 /* pad templates */
 static GstStaticPadTemplate gst_pylonsrc_src_template =
@@ -328,6 +333,16 @@ gst_pylonsrc_class_init (GstPylonSrcClass * klass)
 
   push_src_class->create = GST_DEBUG_FUNCPTR (gst_pylonsrc_create);
 
+  g_object_class_install_property (gobject_class, PROP_FAILRATE,
+      g_param_spec_int ("failrate", "Failed frames",
+          "Specifies the number of consecutive frames to fail before failing everything.",
+          0, 1000, DEFAULT_PROP_FAILRATE,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property (gobject_class, PROP_GRABTIMEOUT,
+      g_param_spec_int ("grabtimeout", "Initial load timeout",
+          "Specifies the number of miiliseconds to wait for frame to be grabed from the camera.",
+          0, 60000, DEFAULT_PROP_GRABTIMEOUT,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
   g_object_class_install_property (gobject_class, PROP_CAMERA,
       g_param_spec_int ("camera", "camera",
           "(Number) Camera ID as defined by Basler's API. If only one camera is connected this parameter will be ignored and the lone camera will be used. If there are multiple cameras and this parameter isn't defined, the plugin will output a list of available cameras and their IDs. Note that if there are multiple cameras available to the API and the camera parameter isn't defined then this plugin will not run.",
@@ -719,6 +734,9 @@ gst_pylonsrc_init (GstPylonSrc * src)
   src->configFile = g_strdup ("");
   src->ignoreDefaults = FALSE;
 
+  src->failrate = DEFAULT_PROP_FAILRATE;
+  src->grabtimeout = DEFAULT_PROP_GRABTIMEOUT;
+
   for (int i = 0; i < PROP_NUM_PROPERTIES; i++) {
     src->propFlags[i] = GST_PYLONSRC_PROPST_DEFAULT;
   }
@@ -1005,6 +1023,12 @@ gst_pylonsrc_set_property (GObject * object, guint property_id,
     case PROP_IGNOREDEFAULTS:
       src->ignoreDefaults = g_value_get_boolean (value);
       break;
+    case PROP_FAILRATE:
+      src->failrate = g_value_get_int (value);
+      break;
+    case PROP_GRABTIMEOUT:
+      src->grabtimeout = g_value_get_int (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
       return;
@@ -1215,6 +1239,12 @@ gst_pylonsrc_get_property (GObject * object, guint property_id,
       break;
     case PROP_IGNOREDEFAULTS:
       g_value_set_boolean (value, src->ignoreDefaults);
+      break;
+    case PROP_FAILRATE:
+      g_value_set_int (value, src->failrate);
+      break;
+    case PROP_GRABTIMEOUT:
+      g_value_set_int (value, src->grabtimeout);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
@@ -3242,6 +3272,7 @@ gst_pylonsrc_load_configuration (GstPylonSrc * src)
           reset_prop (src, prop);
         }
       }
+
       read_all_features (src);
     }
     // We don't really need to reset it, but anyway
@@ -3327,8 +3358,8 @@ gst_pylonsrc_create (GstPushSrc * psrc, GstBuffer ** buf)
       goto error;
     src->acquisition_configured = TRUE;
   }
-  // Wait for the buffer to be filled  (up to 1 s)  
-  res = PylonWaitObjectWait (src->waitObject, 1000, &bufferReady);
+  // Wait for the buffer to be filled  (up to n ms). Can fail on large frames if timeout set too low.
+  res = PylonWaitObjectWait (src->waitObject, src->grabtimeout, &bufferReady);
   PYLONC_CHECK_ERROR (src, res);
   if (!bufferReady) {
     GST_ERROR_OBJECT (src,
@@ -3362,7 +3393,7 @@ gst_pylonsrc_create (GstPushSrc * psrc, GstBuffer ** buf)
     PYLONC_CHECK_ERROR (src, res);
   }
   // Process the current buffer
-  if (grabResult.Status == Grabbed) {
+  if (grabResult.Status == Grabbed || src->failedFrames < src->failrate) {
     VideoFrame *vf = (VideoFrame *) g_malloc0 (sizeof (VideoFrame));
 
     *buf =
@@ -3372,9 +3403,19 @@ gst_pylonsrc_create (GstPushSrc * psrc, GstBuffer ** buf)
 
     vf->buffer_handle = grabResult.hBuffer;
     vf->src = src;
+
+    if (grabResult.Status != Grabbed) {
+      src->failedFrames += 1;
+      GST_WARNING_OBJECT (src,
+          "Failed capture count=%d. Status=%d, ErrorCode=%d", src->failedFrames,
+          grabResult.Status, grabResult.ErrorCode);
+    } else {
+      src->failedFrames = 0;
+    }
   } else {
-    GST_ERROR_OBJECT (src, "Error in the image processing loop. Status=%d",
-        grabResult.Status);
+    GST_ERROR_OBJECT (src,
+        "Error in the image processing loop. Status=%d, ErrorCode=%d",
+        grabResult.Status, grabResult.ErrorCode);
     goto error;
   }
 
